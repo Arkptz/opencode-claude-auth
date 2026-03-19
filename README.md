@@ -15,6 +15,21 @@ macOS is preferred (uses Keychain). Linux and Windows work via the credentials f
 
 ## Installation
 
+One command — install and configure:
+
+```bash
+npm install opencode-claude-auth && node -e "
+const fs = require('fs'), p = require('path').join(require('os').homedir(), '.config/opencode/opencode.json');
+const c = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p,'utf8')) : {};
+c.plugin = [...new Set([...(Array.isArray(c.plugin) ? c.plugin : []), 'opencode-claude-auth'])];
+fs.mkdirSync(require('path').dirname(p), {recursive:true});
+fs.writeFileSync(p, JSON.stringify(c, null, 2));
+console.log('Added opencode-claude-auth to', p);
+"
+```
+
+Or manually:
+
 ```bash
 npm install opencode-claude-auth
 ```
