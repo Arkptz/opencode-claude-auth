@@ -66,6 +66,36 @@ function getUserAgent(): string {
   )
 }
 
+function getStainlessHeaders(): Record<string, string> {
+  return {
+    "x-stainless-arch": process.arch === "arm64" ? "arm64" : process.arch,
+    "x-stainless-lang": "js",
+    "x-stainless-os":
+      process.platform === "darwin" ? "MacOS" : process.platform,
+    "x-stainless-package-version": "0.81.0",
+    "x-stainless-retry-count": "0",
+    "x-stainless-runtime": "node",
+    "x-stainless-runtime-version": process.version,
+    "x-stainless-timeout": "600",
+  }
+}
+
+function buildRequestUrl(input: RequestInfo | URL): string | URL {
+  const raw =
+    typeof input === "string"
+      ? input
+      : input instanceof URL
+        ? input.toString()
+        : input.url
+
+  const url = new URL(raw)
+  if (url.pathname === "/v1/messages" && !url.searchParams.has("beta")) {
+    url.searchParams.set("beta", "true")
+  }
+
+  return typeof input === "string" ? url.toString() : url
+}
+
 // Stable per-process session ID, matching Claude Code's X-Claude-Code-Session-Id
 const sessionId = crypto.randomUUID()
 
@@ -145,10 +175,14 @@ export function buildRequestHeaders(
   headers.set("authorization", `Bearer ${accessToken}`)
   headers.set("anthropic-version", "2023-06-01")
   headers.set("anthropic-beta", mergedBetas.join(","))
+  headers.set("anthropic-dangerous-direct-browser-access", "true")
   headers.set("x-app", "cli")
   headers.set("user-agent", getUserAgent())
   headers.set("x-client-request-id", crypto.randomUUID())
   headers.set("X-Claude-Code-Session-Id", sessionId)
+  for (const [key, value] of Object.entries(getStainlessHeaders())) {
+    if (!headers.has(key)) headers.set(key, value)
+  }
   headers.delete("x-api-key")
 
   return headers
@@ -290,6 +324,7 @@ const plugin: Plugin = async () => {
 
             // Get excluded betas for this model (from previous failed requests)
             const excluded = getExcludedBetas(modelId)
+            const requestUrl = buildRequestUrl(input)
             const headers = buildRequestHeaders(
               input,
               requestInit,
@@ -306,7 +341,7 @@ const plugin: Plugin = async () => {
               .filter(Boolean)
             log("fetch_headers_built", { headerKeys, betas, modelId })
 
-            let response = await fetchWithRetry(input, {
+            let response = await fetchWithRetry(requestUrl, {
               ...requestInit,
               body,
               headers,
@@ -331,7 +366,7 @@ const plugin: Plugin = async () => {
                   modelId,
                   excluded,
                 )
-                response = await fetchWithRetry(input, {
+                response = await fetchWithRetry(requestUrl, {
                   ...requestInit,
                   body,
                   headers: retryHeaders,
@@ -384,7 +419,7 @@ const plugin: Plugin = async () => {
                 newExcluded,
               )
 
-              response = await fetchWithRetry(input, {
+              response = await fetchWithRetry(requestUrl, {
                 ...requestInit,
                 body,
                 headers: newHeaders,
