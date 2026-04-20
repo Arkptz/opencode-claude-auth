@@ -183,7 +183,7 @@ All configurable parameters can be overridden via environment variables. If Anth
 
 | Variable                      | Description                                                                | Default                                                                                                 |
 | ----------------------------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `ANTHROPIC_CLI_VERSION`       | Claude CLI version for user-agent and billing headers                      | `2.1.80`                                                                                                |
+| `ANTHROPIC_CLI_VERSION`       | Claude CLI version for user-agent and billing headers                      | `2.1.114`                                                                                               |
 | `ANTHROPIC_USER_AGENT`        | Full User-Agent string (overrides CLI version)                             | `claude-cli/{version} (external, cli)`                                                                  |
 | `ANTHROPIC_BETA_FLAGS`        | Comma-separated beta feature flags                                         | `claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05` |
 | `ANTHROPIC_ENABLE_1M_CONTEXT` | Enable 1M token context window for 4.6+ models (requires Max subscription) | `false`                                                                                                 |
