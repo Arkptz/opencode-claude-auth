@@ -1,23 +1,28 @@
 #!/usr/bin/env bash
-# check-binary.sh — Compare opencode-claude-auth values against the installed Claude Code binary.
-# Run after every Claude Code update to see what changed and what needs syncing.
+# check-binary.sh — Compare the plugin's current source of truth against the
+# installed Claude Code binary. Run after every Claude Code upgrade.
+#
+# All plugin values are parsed directly from src/*.ts — not hardcoded in this
+# script — so the report always reflects what the code actually does.
 #
 # Usage:
-#   ./scripts/check-binary.sh                  # auto-detect binary
+#   ./scripts/check-binary.sh                  # auto-detect claude binary
 #   ./scripts/check-binary.sh /path/to/binary  # explicit binary path
 #
 set -euo pipefail
 
-# ─── Locate binary ───────────────────────────────────────────────────
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# ─── Locate binary ───────────────────────────────────────────────────────────
 if [[ -n "${1:-}" ]]; then
   BIN="$1"
 else
-  CLAUDE_PATH="$(which claude 2>/dev/null || true)"
+  CLAUDE_PATH="$(command -v claude 2>/dev/null || true)"
   if [[ -z "$CLAUDE_PATH" ]]; then
-    echo "ERROR: 'claude' not found in PATH. Provide binary path as argument." >&2
+    echo "ERROR: 'claude' not in PATH. Pass binary path as argument." >&2
     exit 1
   fi
-  # Resolve nix symlinks: claude → .claude-wrapped (the actual ELF)
+  # Resolve nix wrappers: claude → .claude-wrapped (actual ELF with strings)
   CLAUDE_DIR="$(dirname "$(readlink -f "$CLAUDE_PATH")")"
   if [[ -f "$CLAUDE_DIR/.claude-wrapped" ]]; then
     BIN="$CLAUDE_DIR/.claude-wrapped"
@@ -26,218 +31,384 @@ else
   fi
 fi
 
-if [[ ! -f "$BIN" ]]; then
-  echo "ERROR: Binary not found: $BIN" >&2
-  exit 1
-fi
+[[ -f "$BIN" ]] || { echo "ERROR: binary not found: $BIN" >&2; exit 1; }
 
-echo "═══════════════════════════════════════════════════════"
-echo "  Claude Code Binary Audit"
-echo "  Binary: $BIN"
-echo "  Date:   $(date -Iseconds)"
-echo "═══════════════════════════════════════════════════════"
-echo
+BIN_VERSION="$(claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "?")"
 
-# ─── Helpers ─────────────────────────────────────────────────────────
-GREEN='\033[32m'
-RED='\033[31m'
-YELLOW='\033[33m'
-DIM='\033[2m'
-BOLD='\033[1m'
-RESET='\033[0m'
+# ─── Output helpers ──────────────────────────────────────────────────────────
+GREEN=$'\033[32m'; RED=$'\033[31m'; YELLOW=$'\033[33m'
+DIM=$'\033[2m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
 
-ok()   { echo -e "  ${GREEN}✓${RESET} $1"; }
-warn() { echo -e "  ${YELLOW}⚠${RESET} $1"; }
-fail() { echo -e "  ${RED}✗${RESET} $1"; }
-dim()  { echo -e "  ${DIM}$1${RESET}"; }
-hdr()  { echo -e "\n${BOLD}── $1 ──${RESET}"; }
+ok()   { printf '  %s✓%s %s\n' "$GREEN" "$RESET" "$1"; }
+warn() { printf '  %s⚠%s %s\n' "$YELLOW" "$RESET" "$1"; }
+fail() { printf '  %s✗%s %s\n' "$RED" "$RESET" "$1"; }
+dim()  { printf '  %s%s%s\n' "$DIM" "$1" "$RESET"; }
+hdr()  { printf '\n%s── %s ──%s\n' "$BOLD" "$1" "$RESET"; }
+kv()   { printf '  %-28s %s\n' "$1" "$2"; }
 
-# ─── 1. CLI version ─────────────────────────────────────────────────
-hdr "CLI Version"
-BIN_VERSION=$(claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown")
-PLUGIN_VERSION=$(grep -oP 'ccVersion:\s*"([^"]+)"' src/model-config.ts | grep -oP '"[^"]+"' | tr -d '"')
-echo "  Binary:  $BIN_VERSION"
-echo "  Plugin:  $PLUGIN_VERSION (ccVersion in model-config.ts)"
-if [[ "$BIN_VERSION" == "$PLUGIN_VERSION" ]]; then
-  ok "Versions match"
+# ─── Extract code values via Python parser ─────────────────────────────────
+# Single python pass dumps every plugin constant as shell-safe KEY=VALUE
+# lines and arrays as newline-delimited strings to $CODE_TMPDIR/*.txt.
+CODE_TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$CODE_TMPDIR"' EXIT
+
+REPO_ROOT="$REPO_ROOT" CODE_TMPDIR="$CODE_TMPDIR" python3 <<'PYEOF'
+import re, json, os
+root = os.environ["REPO_ROOT"]
+out  = os.environ["CODE_TMPDIR"]
+
+def read(path):
+    with open(os.path.join(root, path), encoding="utf-8") as f:
+        return f.read()
+
+model_config = read("src/model-config.ts")
+signing      = read("src/signing.ts")
+xxhash       = read("src/xxhash64.ts")
+credentials  = read("src/credentials.ts")
+index_ts     = read("src/index.ts")
+
+env = {}
+
+# --- model-config.ts ---
+m = re.search(r'ccVersion:\s*"([^"]+)"', model_config)
+env["CODE_CC_VERSION"] = m.group(1) if m else ""
+
+def extract_string_array(source, name):
+    m = re.search(name + r":\s*\[([^\]]*)\]", source, re.S)
+    if not m: return []
+    return re.findall(r'"([^"]+)"', m.group(1))
+
+base_betas = extract_string_array(model_config, "baseBetas")
+long_betas = extract_string_array(model_config, "longContextBetas")
+
+# modelOverrides.*.add — flatten all add arrays across every override entry
+override_add_raw = []
+for m in re.finditer(r'add:\s*\[([^\]]*)\]', model_config):
+    override_add_raw += re.findall(r'"([^"]+)"', m.group(1))
+# Deduplicate while preserving order (multiple overrides can add the same beta)
+seen = set()
+override_add = []
+for b in override_add_raw:
+    if b not in seen:
+        seen.add(b)
+        override_add.append(b)
+
+all_code_betas = sorted(set(base_betas + long_betas + override_add))
+
+def dump(name, items):
+    with open(os.path.join(out, name), "w") as f:
+        f.write("\n".join(items))
+
+dump("base_betas.txt",     base_betas)
+dump("long_betas.txt",     long_betas)
+dump("override_add.txt",   override_add)
+dump("all_code_betas.txt", all_code_betas)
+
+# --- signing.ts ---
+m = re.search(r'BILLING_SALT\s*=\s*"([^"]+)"', signing)
+env["CODE_BILLING_SALT"] = m.group(1) if m else ""
+
+m = re.search(r'\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]\s*\.map', signing)
+env["CODE_SAMPLING_INDICES"] = f"[{m.group(1)},{m.group(2)},{m.group(3)}]" if m else ""
+
+m = re.search(r'cch=(\w+);`', signing)
+env["CODE_CCH_PLACEHOLDER"] = m.group(1) if m else ""
+
+# --- xxhash64.ts ---
+m = re.search(r'CCH_SEED\s*=\s*(0x[0-9a-fA-F]+)n', xxhash)
+env["CODE_CCH_SEED"] = m.group(1) if m else ""
+
+m = re.search(r'hash\s*&\s*(0x[0-9a-fA-F]+)n', xxhash)
+env["CODE_CCH_MASK"] = m.group(1) if m else ""
+
+# --- credentials.ts ---
+m = re.search(r'OAUTH_CLIENT_ID\s*=\s*"([^"]+)"', credentials)
+env["CODE_OAUTH_CLIENT_ID"] = m.group(1) if m else ""
+
+m = re.search(r'OAUTH_TOKEN_URL\s*=\s*"([^"]+)"', credentials)
+env["CODE_OAUTH_TOKEN_URL"] = m.group(1) if m else ""
+
+# --- index.ts ---
+m = re.search(r'`claude-cli/\$\{[^}]+\}\s*\((external,\s*[^)]+)\)`', index_ts)
+env["CODE_USER_AGENT_PARENS"] = m.group(1) if m else ""
+
+m = re.search(r'"anthropic-version",\s*"([^"]+)"', index_ts)
+env["CODE_API_VERSION"] = m.group(1) if m else ""
+
+m = re.search(r'x-stainless-package-version"\s*:\s*"([^"]+)"', index_ts)
+env["CODE_STAINLESS_VER"] = m.group(1) if m else ""
+
+m = re.search(r'SYSTEM_IDENTITY_PREFIX\s*=\s*\n?\s*"([^"]+)"', index_ts)
+env["CODE_SYSTEM_IDENTITY"] = m.group(1) if m else ""
+
+with open(os.path.join(out, "env.sh"), "w") as f:
+    for k, v in env.items():
+        f.write(f"{k}={json.dumps(v)}\n")
+PYEOF
+
+# shellcheck source=/dev/null
+source "$CODE_TMPDIR/env.sh"
+
+mapfile -t CODE_BASE_BETAS   < "$CODE_TMPDIR/base_betas.txt"
+mapfile -t CODE_LONG_BETAS   < "$CODE_TMPDIR/long_betas.txt"
+mapfile -t CODE_OVERRIDE_ADD < "$CODE_TMPDIR/override_add.txt"
+mapfile -t CODE_ALL_BETAS    < "$CODE_TMPDIR/all_code_betas.txt"
+
+# ─── Extract binary values ──────────────────────────────────────────────────
+BIN_STRINGS="$CODE_TMPDIR/bin_strings.txt"
+strings -n 8 "$BIN" > "$BIN_STRINGS"
+
+# All date-suffixed betas (YYYY-MM-DD) in the binary.
+# Digits in body allow ids like "context-1m-2025-08-07".
+mapfile -t BIN_DATED_BETAS < <(
+  grep -E '^[a-z][a-z0-9-]+-20[0-9]{2}-[0-9]{2}-[0-9]{2}$' "$BIN_STRINGS" | sort -u
+)
+
+# Non-dated betas: claude-code-YYYYMMDD format (no dashes between date parts)
+mapfile -t BIN_NONDATED_BETAS < <(
+  grep -E '^claude-code-[0-9]{8}$' "$BIN_STRINGS" | sort -u
+)
+
+BIN_ALL_BETAS=( "${BIN_DATED_BETAS[@]}" "${BIN_NONDATED_BETAS[@]}" )
+
+in_array() {
+  local needle="$1"; shift
+  local item
+  for item in "$@"; do [[ "$item" == "$needle" ]] && return 0; done
+  return 1
+}
+
+bin_count() { grep -cF -- "$1" "$BIN_STRINGS" || true; }
+
+# ─── Report ─────────────────────────────────────────────────────────────────
+echo "═══════════════════════════════════════════════════════════════"
+echo "  opencode-claude-auth  ↔  Claude Code binary audit"
+echo "═══════════════════════════════════════════════════════════════"
+kv "Binary"            "$BIN"
+kv "Binary version"    "$BIN_VERSION"
+kv "Plugin ccVersion"  "$CODE_CC_VERSION"
+kv "Report time"       "$(date -Iseconds)"
+
+# ─── 1. CLI version ────────────────────────────────────────────────────────
+hdr "CLI version"
+if [[ "$BIN_VERSION" == "$CODE_CC_VERSION" ]]; then
+  ok "match: $BIN_VERSION"
 else
-  fail "VERSION MISMATCH — update ccVersion in src/model-config.ts to \"$BIN_VERSION\""
+  fail "MISMATCH — plugin=$CODE_CC_VERSION  binary=$BIN_VERSION"
+  dim "fix: set ccVersion = \"$BIN_VERSION\" in src/model-config.ts"
 fi
 
-# ─── 2. Beta flags ──────────────────────────────────────────────────
-hdr "Beta Flags (date-suffixed)"
-echo "  Binary contains:"
-BIN_BETAS=$(strings -n 15 "$BIN" | grep -E '^[a-z][-a-z]+-20[0-9]{2}-[0-9]{2}-[0-9]{2}$' | sort -u)
-echo "$BIN_BETAS" | while read -r b; do dim "  $b"; done
-
-echo
-echo "  Plugin baseBetas (model-config.ts):"
-PLUGIN_BETAS=$(grep -A 20 'baseBetas:' src/model-config.ts | grep -oP '"([^"]+)"' | tr -d '"')
-echo "$PLUGIN_BETAS" | while read -r b; do dim "  $b"; done
-
-echo
-echo "  Comparison:"
-for beta in $PLUGIN_BETAS; do
-  if echo "$BIN_BETAS" | grep -qF "$beta"; then
-    ok "$beta — present in binary"
+# ─── 2. Base betas ──────────────────────────────────────────────────────────
+hdr "baseBetas — sent on every request"
+for beta in "${CODE_BASE_BETAS[@]}"; do
+  [[ -z "$beta" ]] && continue
+  if in_array "$beta" "${BIN_ALL_BETAS[@]}"; then
+    ok "$beta"
   else
-    fail "$beta — NOT FOUND in binary (may have been removed)"
+    fail "$beta — NOT in binary"
   fi
 done
-# Check for betas in binary that we don't have
-for beta in $BIN_BETAS; do
-  if ! echo "$PLUGIN_BETAS" | grep -qF "$beta"; then
-    # Only flag the ones that look relevant to Claude Code API
-    case "$beta" in
-      claude-code-*|oauth-*|interleaved-thinking-*|prompt-caching-*|context-*|effort-*)
-        warn "$beta — in binary but NOT in plugin baseBetas"
-        ;;
-    esac
+
+# ─── 3. Long context betas ─────────────────────────────────────────────────
+hdr "longContextBetas — added when ANTHROPIC_ENABLE_1M_CONTEXT=true"
+for beta in "${CODE_LONG_BETAS[@]}"; do
+  [[ -z "$beta" ]] && continue
+  if in_array "$beta" "${BIN_ALL_BETAS[@]}"; then
+    ok "$beta"
+  else
+    fail "$beta — NOT in binary"
   fi
 done
 
-# ─── 3. Billing salt ────────────────────────────────────────────────
-hdr "Billing Salt"
-PLUGIN_SALT=$(grep -oP 'BILLING_SALT\s*=\s*"([^"]+)"' src/signing.ts | grep -oP '"[^"]+"' | tr -d '"')
-SALT_COUNT=$(strings -n 8 "$BIN" | grep -c "$PLUGIN_SALT" || true)
-echo "  Plugin salt: $PLUGIN_SALT"
-echo "  Occurrences in binary: $SALT_COUNT"
-if [[ "$SALT_COUNT" -gt 0 ]]; then
-  ok "Billing salt is still valid"
+# ─── 4. Model-override betas (effort-*, etc) ───────────────────────────────
+hdr "modelOverrides.*.add — per-model extra betas"
+if [[ ${#CODE_OVERRIDE_ADD[@]} -eq 0 ]] || [[ -z "${CODE_OVERRIDE_ADD[0]:-}" ]]; then
+  dim "(none defined)"
 else
-  fail "Billing salt NOT FOUND — needs updating!"
-fi
-
-# ─── 4. Version suffix sampling indices ─────────────────────────────
-hdr "Version Suffix Sampling Indices [4,7,20]"
-INDICES_COUNT=$(python3 -c "
-with open('$BIN', 'rb') as f:
-    data = f.read()
-print(data.count(b'[4,7,20]'))
-" 2>/dev/null || echo "0")
-echo "  Occurrences of [4,7,20] in binary: $INDICES_COUNT"
-if [[ "$INDICES_COUNT" -gt 0 ]]; then
-  ok "Sampling indices unchanged"
-else
-  fail "Sampling indices NOT FOUND — algorithm may have changed!"
-fi
-
-# ─── 5. CCH / xxHash64 seed ─────────────────────────────────────────
-hdr "CCH Hash (xxHash64)"
-PLUGIN_SEED=$(grep -oP 'CCH_SEED\s*=\s*(0x[0-9a-fA-F]+)' src/xxhash64.ts | grep -oP '0x[0-9a-fA-F]+')
-echo "  Plugin CCH_SEED: $PLUGIN_SEED"
-echo "  cch=00000 placeholder in binary: $(strings -n 8 "$BIN" | grep -c 'cch=00000' || true) occurrences"
-echo "  Bun.hash references: $(python3 -c "
-with open('$BIN', 'rb') as f:
-    print(f.read().count(b'Bun.hash('))
-" 2>/dev/null || echo "?")"
-echo "  xxhash references: $(python3 -c "
-with open('$BIN', 'rb') as f:
-    data = f.read()
-    print(f'xxhash={data.count(b\"xxhash\")} xxHash64={data.count(b\"xxHash64\")} wyhash={data.count(b\"wyhash\")}')
-" 2>/dev/null || echo "?")"
-dim "Note: Seed is embedded as Bun native — not directly extractable as string."
-dim "Use 'pnpm run extract:cch' to verify against live CLI if needed."
-
-# ─── 6. OAuth client ID ─────────────────────────────────────────────
-hdr "OAuth Client ID"
-PLUGIN_CLIENT_ID=$(grep -oP 'OAUTH_CLIENT_ID\s*=\s*"([^"]+)"' src/credentials.ts | grep -oP '"[^"]+"' | tr -d '"')
-CLIENT_ID_COUNT=$(strings -n 20 "$BIN" | grep -c "$PLUGIN_CLIENT_ID" || true)
-echo "  Plugin: $PLUGIN_CLIENT_ID"
-echo "  In binary: $CLIENT_ID_COUNT occurrences"
-if [[ "$CLIENT_ID_COUNT" -gt 0 ]]; then
-  ok "OAuth client ID matches"
-else
-  fail "OAuth client ID NOT FOUND — may have changed!"
-fi
-
-# ─── 7. OAuth token endpoint ────────────────────────────────────────
-hdr "OAuth Token Endpoint"
-PLUGIN_ENDPOINT=$(grep -oP 'OAUTH_TOKEN_URL\s*=\s*"([^"]+)"' src/credentials.ts | grep -oP '"[^"]+"' | tr -d '"')
-ENDPOINT_COUNT=$(strings -n 10 "$BIN" | grep -cF "$(echo "$PLUGIN_ENDPOINT" | sed 's|https://||')" || true)
-echo "  Plugin: $PLUGIN_ENDPOINT"
-echo "  Fragments in binary: $ENDPOINT_COUNT"
-if [[ "$ENDPOINT_COUNT" -gt 0 ]]; then
-  ok "OAuth endpoint still valid"
-else
-  warn "OAuth endpoint not confirmed in binary strings (may be obfuscated)"
-fi
-
-# ─── 8. System identity prompt ──────────────────────────────────────
-hdr "System Identity Prompt"
-IDENTITY="You are Claude Code, Anthropic's official CLI for Claude."
-IDENTITY_COUNT=$(strings -n 30 "$BIN" | grep -cF "$IDENTITY" || true)
-echo "  Identity string: \"$IDENTITY\""
-echo "  In binary: $IDENTITY_COUNT occurrences"
-if [[ "$IDENTITY_COUNT" -gt 0 ]]; then
-  ok "System identity string unchanged"
-else
-  fail "System identity string NOT FOUND — may have changed!"
-fi
-
-# ─── 9. API version ─────────────────────────────────────────────────
-hdr "API Version"
-API_VER="2023-06-01"
-API_VER_COUNT=$(strings -n 8 "$BIN" | grep -c "^${API_VER}$" || true)
-echo "  Plugin: $API_VER"
-echo "  In binary: $API_VER_COUNT occurrences"
-if [[ "$API_VER_COUNT" -gt 0 ]]; then
-  ok "anthropic-version header unchanged"
-else
-  fail "anthropic-version NOT FOUND — check if it changed!"
-fi
-
-# ─── 10. Billing header format ──────────────────────────────────────
-hdr "Billing Header Format"
-echo "  Format markers in binary:"
-for marker in "x-anthropic-billing-header" "cc_version=" "cc_entrypoint=" "cch=00000" "cc_workload="; do
-  COUNT=$(strings -n 8 "$BIN" | grep -cF "$marker" || true)
-  if [[ "$COUNT" -gt 0 ]]; then
-    ok "$marker — $COUNT occurrences"
-  else
-    if [[ "$marker" == "cc_workload=" ]]; then
-      dim "$marker — $COUNT (optional, only in new versions)"
+  for beta in "${CODE_OVERRIDE_ADD[@]}"; do
+    [[ -z "$beta" ]] && continue
+    if in_array "$beta" "${BIN_ALL_BETAS[@]}"; then
+      ok "$beta"
     else
-      fail "$marker — NOT FOUND"
+      fail "$beta — NOT in binary"
     fi
-  fi
-done
-
-# ─── 11. New betas not in plugin ────────────────────────────────────
-hdr "Potentially Relevant New Betas (in binary, not in plugin)"
-ALL_PLUGIN_BETAS=$(grep -oP '"[a-z][-a-z]+-20[0-9]{2}-[0-9]{2}-[0-9]{2}"' src/model-config.ts src/betas.ts 2>/dev/null | grep -oP '"[^"]+"' | tr -d '"' | sort -u)
-NEW_BETAS=()
-for beta in $BIN_BETAS; do
-  if ! echo "$ALL_PLUGIN_BETAS" | grep -qF "$beta"; then
-    case "$beta" in
-      claude-code-*|oauth-*|interleaved-thinking-*|prompt-caching-*|context-*|effort-*)
-        NEW_BETAS+=("$beta")
-        ;;
-    esac
-  fi
-done
-if [[ ${#NEW_BETAS[@]} -eq 0 ]]; then
-  ok "No new relevant betas found"
-else
-  for b in "${NEW_BETAS[@]}"; do
-    warn "NEW: $b"
   done
 fi
 
-# ─── 12. Model alias map ────────────────────────────────────────────
-hdr "Default Model Aliases (from binary)"
-echo "  Nw6 map in binary (last known):"
-for alias_search in 'opus.*claude-opus' 'sonnet.*claude-sonnet' 'haiku.*claude-haiku'; do
-  ALIAS=$(strings -n 10 "$BIN" | grep -oP "${alias_search}[\"'\w.-]*" | head -1 || true)
-  if [[ -n "$ALIAS" ]]; then
-    dim "$ALIAS"
+# ─── 5. New betas in binary but not referenced by plugin ───────────────────
+hdr "Betas present in binary but NOT used by plugin"
+any_new=0
+for beta in "${BIN_ALL_BETAS[@]}"; do
+  if ! in_array "$beta" "${CODE_ALL_BETAS[@]}"; then
+    dim "· $beta"
+    any_new=1
   fi
 done
-echo "  Direct search:"
-strings -n 10 "$BIN" | grep -E '"(opus|sonnet|haiku)":"claude-' | head -5 | while read -r line; do dim "$line"; done
+if [[ $any_new -eq 0 ]]; then
+  ok "none — plugin tracks every known beta in the binary"
+fi
 
-# ─── Summary ─────────────────────────────────────────────────────────
+# ─── 6. Billing salt ───────────────────────────────────────────────────────
+hdr "Billing salt (used in version-suffix SHA-256 input)"
+COUNT="$(bin_count "$CODE_BILLING_SALT")"
+kv "Plugin"         "$CODE_BILLING_SALT"
+kv "In binary"      "$COUNT occurrence(s)"
+if [[ "$COUNT" -gt 0 ]]; then
+  ok "salt still present in binary"
+else
+  fail "salt not found — algorithm or constant likely changed"
+fi
+
+# ─── 7. Sampling indices ───────────────────────────────────────────────────
+hdr "Version-suffix sampling indices"
+COUNT="$(bin_count "$CODE_SAMPLING_INDICES")"
+kv "Plugin"         "$CODE_SAMPLING_INDICES"
+kv "In binary"      "$COUNT occurrence(s)"
+if [[ "$COUNT" -gt 0 ]]; then
+  ok "indices unchanged"
+else
+  fail "indices not found — Claude may sample different positions now"
+fi
+
+# ─── 8. CCH placeholder ────────────────────────────────────────────────────
+hdr "CCH placeholder (replaced with xxHash64 output after body hash)"
+PLACEHOLDER="cch=$CODE_CCH_PLACEHOLDER"
+COUNT="$(bin_count "$PLACEHOLDER")"
+kv "Plugin"     "$PLACEHOLDER"
+kv "In binary"  "$COUNT occurrence(s)"
+if [[ "$COUNT" -gt 0 ]]; then
+  ok "placeholder format unchanged"
+else
+  fail "placeholder NOT found — binary may use a different token"
+fi
+
+# ─── 9. CCH seed & mask ────────────────────────────────────────────────────
+hdr "CCH hash constants (xxHash64)"
+kv "Plugin CCH_SEED"  "$CODE_CCH_SEED"
+kv "Plugin mask"      "$CODE_CCH_MASK (low 20 bits → 5 hex chars)"
+BUN_HASH="$(grep -cF 'Bun.hash(' "$BIN_STRINGS" || true)"
+XXHASH="$(grep -cF 'xxhash' "$BIN_STRINGS" || true)"
+WYHASH="$(grep -cF 'wyhash' "$BIN_STRINGS" || true)"
+kv "Bun.hash refs"    "$BUN_HASH"
+kv "xxhash refs"      "$XXHASH"
+kv "wyhash refs"      "$WYHASH"
+dim "Seed is Bun native bytecode, not a raw string — cannot grep."
+dim "Run 'pnpm run extract:cch' to verify live hash equality."
+
+# ─── 10. OAuth client ID ───────────────────────────────────────────────────
+hdr "OAuth client ID (token refresh)"
+COUNT="$(bin_count "$CODE_OAUTH_CLIENT_ID")"
+kv "Plugin"     "$CODE_OAUTH_CLIENT_ID"
+kv "In binary"  "$COUNT occurrence(s)"
+if [[ "$COUNT" -gt 0 ]]; then
+  ok "client ID unchanged"
+else
+  fail "client ID not found — OAuth app may have rotated"
+fi
+
+# ─── 11. OAuth token URL ───────────────────────────────────────────────────
+hdr "OAuth token endpoint"
+kv "Plugin"     "$CODE_OAUTH_TOKEN_URL"
+HOST="$(echo "$CODE_OAUTH_TOKEN_URL" | sed 's|https\?://||;s|/.*||')"
+PATH_FRAG="$(echo "$CODE_OAUTH_TOKEN_URL" | sed 's|.*://[^/]*||')"
+HOST_COUNT="$(bin_count "$HOST")"
+PATH_COUNT="$(bin_count "$PATH_FRAG")"
+kv "host '$HOST'"      "$HOST_COUNT occurrence(s)"
+kv "path '$PATH_FRAG'" "$PATH_COUNT occurrence(s)"
+if [[ "$PATH_COUNT" -gt 0 ]]; then
+  ok "token endpoint path present"
+elif [[ "$HOST_COUNT" -gt 0 ]]; then
+  warn "host found but not path — endpoint may have moved"
+else
+  warn "endpoint not found as a literal (may be built at runtime)"
+fi
+
+# ─── 12. User-Agent format ─────────────────────────────────────────────────
+hdr "User-Agent parenthetical"
+kv "Plugin"     "claude-cli/<ver> ($CODE_USER_AGENT_PARENS)"
+COUNT="$(bin_count "($CODE_USER_AGENT_PARENS)")"
+kv "In binary"  "$COUNT occurrence(s)"
+if [[ "$COUNT" -gt 0 ]]; then
+  ok "user-agent format unchanged"
+else
+  warn "format not literal-matched (string may be built from fragments)"
+fi
+
+# ─── 13. System identity prompt ────────────────────────────────────────────
+hdr "System identity prefix"
+COUNT="$(bin_count "$CODE_SYSTEM_IDENTITY")"
+kv "Plugin"     "\"$CODE_SYSTEM_IDENTITY\""
+kv "In binary"  "$COUNT occurrence(s)"
+if [[ "$COUNT" -gt 0 ]]; then
+  ok "identity string unchanged"
+else
+  fail "identity string not found — prompt wording may have changed"
+fi
+
+# ─── 14. API version header ────────────────────────────────────────────────
+hdr "anthropic-version header value"
+COUNT="$(grep -cE "^${CODE_API_VERSION}$" "$BIN_STRINGS" || true)"
+kv "Plugin"                  "$CODE_API_VERSION"
+kv "In binary (exact match)" "$COUNT occurrence(s)"
+if [[ "$COUNT" -gt 0 ]]; then
+  ok "API version unchanged"
+else
+  fail "API version not found as exact string"
+fi
+
+# ─── 15. Billing header format markers ─────────────────────────────────────
+hdr "Billing header format markers"
+for marker in "x-anthropic-billing-header" "cc_version=" "cc_entrypoint=" "cch="; do
+  COUNT="$(bin_count "$marker")"
+  if [[ "$COUNT" -gt 0 ]]; then
+    ok "$marker  ($COUNT occurrences)"
+  else
+    fail "$marker  — NOT in binary"
+  fi
+done
+COUNT="$(bin_count "cc_workload=")"
+if [[ "$COUNT" -gt 0 ]]; then
+  dim "note: binary also emits cc_workload=  ($COUNT occurrences) — plugin does not"
+fi
+
+# ─── 16. Stainless SDK package version ─────────────────────────────────────
+hdr "Stainless SDK (Anthropic TypeScript SDK) package version"
+kv "Plugin hardcoded"  "$CODE_STAINLESS_VER"
+# The SDK bakes the version as `var <minified>="X.Y.Z"` right before the
+# runtime-detection function ({typeof Deno<"u"...}). Anchor on that pattern.
+BIN_SDK_VER="$(
+  python3 - "$BIN" <<'PYEOF'
+import re, sys
+with open(sys.argv[1], "rb") as f:
+    data = f.read()
+m = re.search(
+    rb'[A-Za-z_$][\w$]*="(\d+\.\d+\.\d+)";function\s+[A-Za-z_$][\w$]*\(\)\{if\(typeof Deno',
+    data,
+)
+print(m.group(1).decode() if m else "")
+PYEOF
+)"
+if [[ -n "$BIN_SDK_VER" ]]; then
+  kv "In binary"  "$BIN_SDK_VER"
+  if [[ "$BIN_SDK_VER" == "$CODE_STAINLESS_VER" ]]; then
+    ok "SDK version matches"
+  else
+    warn "SDK version drift: plugin=$CODE_STAINLESS_VER  binary=$BIN_SDK_VER"
+    dim "update x-stainless-package-version in src/index.ts to $BIN_SDK_VER"
+  fi
+else
+  warn "couldn't extract SDK version from binary — verify manually"
+fi
+
+# ─── 17. Model alias map (info) ────────────────────────────────────────────
+hdr "Known model aliases in binary (firstParty identifiers)"
+grep -oE 'firstParty:"claude-[a-z0-9-]+' "$BIN_STRINGS" \
+  | sort -u | sed 's/firstParty:"//' | while read -r model; do
+  dim "· $model"
+done
+
+# ─── Summary ────────────────────────────────────────────────────────────────
 echo
-echo "═══════════════════════════════════════════════════════"
-echo "  Audit complete. Review ⚠ and ✗ items above."
-echo "═══════════════════════════════════════════════════════"
+echo "═══════════════════════════════════════════════════════════════"
+echo "  Audit complete. Review any ✗ (fail) or ⚠ (warn) items above."
+echo "═══════════════════════════════════════════════════════════════"
