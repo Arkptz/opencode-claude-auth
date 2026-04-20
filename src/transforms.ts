@@ -25,6 +25,7 @@ function deobfuscateToolName(obf: string): string {
   return toolNameMap.get(obf) ?? obf
 }
 
+
 const SYSTEM_IDENTITY =
   "You are Claude Code, Anthropic's official CLI for Claude."
 

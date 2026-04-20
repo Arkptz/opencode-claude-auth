@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.5.0](https://github.com/griffinmartin/opencode-claude-auth/compare/v1.4.10...v1.5.0) (2026-04-16)
+
+
+### Features
+
+* add Claude Opus 4.7 model support ([#203](https://github.com/griffinmartin/opencode-claude-auth/issues/203)) ([cc96338](https://github.com/griffinmartin/opencode-claude-auth/commit/cc963387b7a6d95c9dbdd1782c2e594b5aa3d6ba))
+
+## [1.4.10](https://github.com/griffinmartin/opencode-claude-auth/compare/v1.4.9...v1.4.10) (2026-04-14)
+
+
+### Bug Fixes
+
+* PascalCase tool names after mcp_ prefix to match Claude Code convention ([#191](https://github.com/griffinmartin/opencode-claude-auth/issues/191)) ([9121ca4](https://github.com/griffinmartin/opencode-claude-auth/commit/9121ca47a5e9757e041aea240a29c10e4dfabf95))
+
 ## [1.4.9](https://github.com/griffinmartin/opencode-claude-auth/compare/v1.4.8...v1.4.9) (2026-04-08)
 
 
